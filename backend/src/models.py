@@ -117,6 +117,35 @@ class AnalysisJob(Base):
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
+class ClusterSetting(Base):
+    """单行表：当前生效的 DBSCAN 默认参数。"""
+    __tablename__ = "cluster_settings"
+    id = Column(Integer, primary_key=True)
+    eps_m = Column(Float, nullable=False)
+    min_samples = Column(Integer, nullable=False)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+class ParameterTrial(Base):
+    """聚类参数对照试算报告：同批测点在现行参数与候选参数下的两次试算差异。"""
+    __tablename__ = "parameter_trials"
+    id = Column(Integer, primary_key=True)
+    trial_code = Column(String(60), unique=True, nullable=False)
+    batch_id = Column(Integer, ForeignKey("survey_batches.id"), nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    status = Column(String(20), nullable=False, default="open")
+    baseline_eps_m = Column(Float, nullable=False)
+    baseline_min_samples = Column(Integer, nullable=False)
+    candidate_eps_m = Column(Float, nullable=False)
+    candidate_min_samples = Column(Integer, nullable=False)
+    point_snapshot_hash = Column(String(64), nullable=False)
+    point_snapshot = Column(JSON, nullable=False, default=list)
+    report = Column(JSON, nullable=False, default=dict)
+    stale_reason = Column(Text, nullable=True)
+    approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id = Column(Integer, primary_key=True)

@@ -10,6 +10,8 @@ from .geometry import bounds, overlaps
 EPS_METERS = 26.0
 MIN_SAMPLES = 3
 
+DEFAULT_CLUSTER_PARAMS = {"eps_m": EPS_METERS, "min_samples": MIN_SAMPLES}
+
 def build_input(db, batch):
     points = db.execute(select(SurveyPoint).where(SurveyPoint.batch_id == batch.id).order_by(SurveyPoint.id)).scalars().all()
     return [{"id": p.id, "point_code": p.point_code, "x": p.x, "y": p.y, "settlement_mm": p.settlement_mm, "coordinate_reference": p.coordinate_reference} for p in points]
@@ -34,7 +36,11 @@ def cluster_batch(db, job_id):
             job.finished_at = datetime.now(timezone.utc)
             db.commit(); return
         matrix = np.array([[p["x"], p["y"]] for p in points], dtype=float)
-        labels = DBSCAN(eps=EPS_METERS, min_samples=MIN_SAMPLES).fit_predict(matrix)
+        # 参数在入队时快照进 input_summary：已排队任务始终按入队时的参数运行
+        job_params = job.input_summary.get("params") or {}
+        eps_m = float(job_params.get("eps_m", EPS_METERS))
+        min_samples = int(job_params.get("min_samples", MIN_SAMPLES))
+        labels = DBSCAN(eps=eps_m, min_samples=min_samples).fit_predict(matrix)
         existing = db.execute(select(RepairZone).where(RepairZone.batch_id == batch.id)).scalars().all()
         for zone in existing:
             db.delete(zone)
@@ -58,7 +64,7 @@ def cluster_batch(db, job_id):
                 status="proposed", point_ids=[p["id"] for p in members],
                 center_x=round(center_x, 2), center_y=round(center_y, 2),
                 average_settlement_mm=round(avg_settlement, 2), max_settlement_mm=round(max_settlement, 2),
-                local_density=density, boundary=b, original_cluster_evidence={"algorithm": "DBSCAN", "eps_m": EPS_METERS, "min_samples": MIN_SAMPLES, "point_codes": [p["point_code"] for p in members], "label": label},
+                local_density=density, boundary=b, original_cluster_evidence={"algorithm": "DBSCAN", "eps_m": eps_m, "min_samples": min_samples, "point_codes": [p["point_code"] for p in members], "label": label},
             )
             db.add(zone); zone_rows.append((zone, b))
         db.flush()
@@ -80,7 +86,7 @@ def cluster_batch(db, job_id):
                 model_point.local_density = next((z.local_density for z, _ in zone_rows if model_point.id in (z.point_ids or [])), None)
                 model_point.quality_status = "clustered"
         batch.status = "clustered"
-        job.result = {"algorithm": "DBSCAN + local density score", "eps_m": EPS_METERS, "min_samples": MIN_SAMPLES, "cluster_count": cluster_count, "noise_count": noise_count, "conflicted_zones": conflicts, "point_count": len(points), "formula": "local_density = cluster_points / bbox_area × 10000"}
+        job.result = {"algorithm": "DBSCAN + local density score", "eps_m": eps_m, "min_samples": min_samples, "cluster_count": cluster_count, "noise_count": noise_count, "conflicted_zones": conflicts, "point_count": len(points), "formula": "local_density = cluster_points / bbox_area × 10000"}
         job.status = "succeeded"; job.finished_at = datetime.now(timezone.utc)
         db.commit()
     except Exception as exc:

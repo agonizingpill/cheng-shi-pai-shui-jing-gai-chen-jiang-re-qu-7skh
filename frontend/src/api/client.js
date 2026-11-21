@@ -17,3 +17,7 @@ export const acknowledgeNotice=id=>api(`/work-notices/${id}/acknowledge`,{method
 export const startRepair=id=>api(`/zones/${id}/start-repair`,{method:'POST'});
 export const submitResurvey=(id,payload)=>api(`/zones/${id}/resurvey`,{method:'POST',body:JSON.stringify(payload)});
 export const verifyResurvey=id=>api(`/resurveys/${id}/verify`,{method:'POST'});
+export const listTrials=(batchId)=>api(`/parameter-trials${batchId?`?batch_id=${batchId}`:''}`);
+export const createTrial=(batchId,payload)=>api(`/survey-batches/${batchId}/parameter-trials`,{method:'POST',body:JSON.stringify(payload)});
+export const retrial=id=>api(`/parameter-trials/${id}/retrial`,{method:'POST'});
+export const approveTrial=id=>api(`/parameter-trials/${id}/approve`,{method:'POST'});

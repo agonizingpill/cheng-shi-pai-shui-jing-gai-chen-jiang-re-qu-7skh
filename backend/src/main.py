@@ -7,12 +7,13 @@ from sqlalchemy.orm import Session
 from redis import Redis
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import AnalysisJob, AuditLog, ManholeAsset, RepairZone, Resurvey, SurveyBatch, SurveyPoint, User, WorkNotice
-from .schemas import BatchIn, LoginIn, NoticeIn, ResurveyIn, SurveyPointIn
+from .models import AnalysisJob, AuditLog, ClusterSetting, ManholeAsset, ParameterTrial, RepairZone, Resurvey, SurveyBatch, SurveyPoint, User, WorkNotice
+from .schemas import BatchIn, LoginIn, NoticeIn, ParameterTrialIn, ResurveyIn, SurveyPointIn
 from .security import create_token, current_user, require_roles, verify_password
 from .services.audit import record
-from .services.cluster import build_input
+from .services.cluster import DEFAULT_CLUSTER_PARAMS, build_input
 from .services.geometry import bounds, overlaps
+from .services.trial import EPS_LIMITS, MIN_SAMPLES_LIMITS, build_trial, mark_open_trials_stale, snapshot_hash, snapshot_points
 from .middlewares.audit import RequestAuditMiddleware
 from .middlewares.rate_limit import SimpleRateLimitMiddleware
 
@@ -27,6 +28,13 @@ redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), de
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
+    db = SessionLocal()
+    try:
+        if not db.execute(select(ClusterSetting)).scalar_one_or_none():
+            db.add(ClusterSetting(**DEFAULT_CLUSTER_PARAMS))
+            db.commit()
+    finally:
+        db.close()
     if os.getenv("SEED_DEMO", "true").lower() == "true":
         try:
             from scripts.seed_demo import seed
@@ -61,6 +69,24 @@ def notice_view(n):
 def resurvey_view(r):
     return {"id": r.id, "record_code": r.record_code, "zone_id": r.zone_id, "measured_at": iso(r.measured_at), "settlement_before_mm": r.settlement_before_mm, "settlement_after_mm": r.settlement_after_mm, "delta_mm": r.delta_mm, "pass_fail": r.pass_fail, "status": r.status, "verified_by": r.verified_by, "notes": r.notes}
 
+def get_cluster_setting(db):
+    setting = db.execute(select(ClusterSetting).where(ClusterSetting.id == 1)).scalar_one_or_none()
+    if not setting:
+        setting = ClusterSetting(id=1, **DEFAULT_CLUSTER_PARAMS)
+        db.add(setting); db.commit(); db.refresh(setting)
+    return setting
+
+def setting_view(setting):
+    return {"eps_m": setting.eps_m, "min_samples": setting.min_samples, "updated_at": iso(setting.updated_at), "updated_by": setting.updated_by}
+
+def trial_view(t):
+    return {"id": t.id, "trial_code": t.trial_code, "batch_id": t.batch_id, "status": t.status,
+            "baseline_eps_m": t.baseline_eps_m, "baseline_min_samples": t.baseline_min_samples,
+            "candidate_eps_m": t.candidate_eps_m, "candidate_min_samples": t.candidate_min_samples,
+            "point_snapshot_hash": t.point_snapshot_hash, "report": t.report, "stale_reason": t.stale_reason,
+            "approved_by": t.approved_by, "approved_at": iso(t.approved_at), "created_at": iso(t.created_at),
+            "created_by": t.created_by}
+
 @app.post("/api/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
     user = db.execute(select(User).where(User.username == payload.username)).scalar_one_or_none()
@@ -81,7 +107,9 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user))
     notices = db.execute(select(WorkNotice).order_by(WorkNotice.id)).scalars().all()
     resurveys = db.execute(select(Resurvey).order_by(Resurvey.id.desc())).scalars().all()
     jobs = db.execute(select(AnalysisJob).order_by(AnalysisJob.id.desc())).scalars().all()
-    return {"user": user_view(user), "stats": {"assets": len(assets), "points": len(points), "zones": len(zones), "open_zones": sum(z.status not in ["closed", "split"] for z in zones), "notices": len(notices), "resurveys": len(resurveys)}, "batches": [{"id": b.id, "batch_code": b.batch_code, "measured_at": iso(b.measured_at), "instrument": b.instrument, "coordinate_reference": b.coordinate_reference, "status": b.status, "notes": b.notes, "point_count": len(b.points)} for b in batches], "assets": [asset_view(a) for a in assets], "points": [point_view(p) for p in points], "zones": [zone_view(z, db) for z in zones], "notices": [notice_view(n) for n in notices], "resurveys": [resurvey_view(r) for r in resurveys], "jobs": [{"id": j.id, "job_code": j.job_code, "batch_id": j.batch_id, "status": j.status, "result": j.result, "error": j.error, "finished_at": iso(j.finished_at)} for j in jobs]}
+    setting = get_cluster_setting(db)
+    trials = db.execute(select(ParameterTrial).order_by(ParameterTrial.id.desc())).scalars().all()
+    return {"user": user_view(user), "cluster_setting": setting_view(setting), "parameter_trials": [trial_view(t) for t in trials], "stats": {"assets": len(assets), "points": len(points), "zones": len(zones), "open_zones": sum(z.status not in ["closed", "split"] for z in zones), "notices": len(notices), "resurveys": len(resurveys)}, "batches": [{"id": b.id, "batch_code": b.batch_code, "measured_at": iso(b.measured_at), "instrument": b.instrument, "coordinate_reference": b.coordinate_reference, "status": b.status, "notes": b.notes, "point_count": len(b.points)} for b in batches], "assets": [asset_view(a) for a in assets], "points": [point_view(p) for p in points], "zones": [zone_view(z, db) for z in zones], "notices": [notice_view(n) for n in notices], "resurveys": [resurvey_view(r) for r in resurveys], "jobs": [{"id": j.id, "job_code": j.job_code, "batch_id": j.batch_id, "status": j.status, "result": j.result, "error": j.error, "finished_at": iso(j.finished_at)} for j in jobs]}
 
 @app.get("/api/survey-batches/{batch_id}")
 def batch_detail(batch_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
@@ -108,8 +136,10 @@ def add_point(batch_id: int, payload: SurveyPointIn, db: Session = Depends(get_d
         raise HTTPException(409, "批次已进入聚类流程，不能追加测量点")
     if db.execute(select(SurveyPoint).where(SurveyPoint.point_code == payload.point_code)).scalar_one_or_none():
         raise HTTPException(409, "测量点编号已存在")
-    point = SurveyPoint(batch_id=batch_id, manhole_id=payload.manhole_id, **payload.model_dump())
-    db.add(point); record(db, user.id, "add_survey_point", "SurveyPoint", payload.point_code, {"batch_code": batch.batch_code}); db.commit(); db.refresh(point)
+    point = SurveyPoint(batch_id=batch_id, **payload.model_dump())
+    db.add(point); db.flush()
+    stale_count = mark_open_trials_stale(db, batch_id, f"测量点 {payload.point_code} 新增，测点集合已变化，对照报告过期需重算")
+    record(db, user.id, "add_survey_point", "SurveyPoint", payload.point_code, {"batch_code": batch.batch_code, "stale_trials": stale_count}); db.commit(); db.refresh(point)
     return point_view(point)
 
 @app.post("/api/survey-points/{point_id}/correct-datum")
@@ -120,7 +150,8 @@ def correct_datum(point_id: int, db: Session = Depends(get_db), user: User = Dep
     batch = db.get(SurveyBatch, point.batch_id)
     old = point.coordinate_reference; point.coordinate_reference = batch.coordinate_reference; point.quality_status = "datum_corrected"
     if batch.status == "blocked": batch.status = "ready"
-    record(db, user.id, "correct_coordinate_reference", "SurveyPoint", point.point_code, {"from": old, "to": point.coordinate_reference}); db.commit()
+    stale_count = mark_open_trials_stale(db, point.batch_id, f"测量点 {point.point_code} 坐标基准由 {old} 修正为 {point.coordinate_reference}，对照报告过期需重算")
+    record(db, user.id, "correct_coordinate_reference", "SurveyPoint", point.point_code, {"from": old, "to": point.coordinate_reference, "stale_trials": stale_count}); db.commit()
     return {"point_code": point.point_code, "coordinate_reference": point.coordinate_reference, "batch_status": batch.status}
 
 @app.post("/api/survey-batches/{batch_id}/cluster")
@@ -136,8 +167,10 @@ def enqueue_cluster(batch_id: int, db: Session = Depends(get_db), user: User = D
         db.commit()
         conflicts = [p["point_code"] for p in points if p["coordinate_reference"] != batch.coordinate_reference]
         raise HTTPException(status_code=409, detail={"code": "DATUM_CONFLICT", "message": "测量点存在坐标基准冲突，禁止聚类", "point_codes": conflicts, "batch_status": batch.status})
-    job = AnalysisJob(job_code=f"JOB-{batch.batch_code}-{int(datetime.now().timestamp())}", batch_id=batch.id, status="queued", input_summary={"points": points, "params": {"eps_m": 26.0, "min_samples": 3}})
-    batch.status = "queued"; db.add(job); record(db, user.id, "enqueue_spatial_cluster", "AnalysisJob", job.job_code, {"batch_code": batch.batch_code, "point_count": len(points)}); db.commit(); db.refresh(job)
+    setting = get_cluster_setting(db)
+    params = {"eps_m": setting.eps_m, "min_samples": setting.min_samples}
+    job = AnalysisJob(job_code=f"JOB-{batch.batch_code}-{int(datetime.now().timestamp())}", batch_id=batch.id, status="queued", input_summary={"points": points, "params": params})
+    batch.status = "queued"; db.add(job); record(db, user.id, "enqueue_spatial_cluster", "AnalysisJob", job.job_code, {"batch_code": batch.batch_code, "point_count": len(points), "params": params}); db.commit(); db.refresh(job)
     redis_client.rpush("manhole_settlement_jobs", str(job.id))
     return {"job_id": job.id, "job_code": job.job_code, "status": job.status}
 
@@ -146,6 +179,130 @@ def job_detail(job_id: int, db: Session = Depends(get_db), user: User = Depends(
     job = db.get(AnalysisJob, job_id)
     if not job: raise HTTPException(404, "分析任务不存在")
     return {"id": job.id, "job_code": job.job_code, "status": job.status, "result": job.result, "error": job.error, "finished_at": iso(job.finished_at)}
+
+@app.get("/api/cluster-settings")
+def cluster_settings(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    return setting_view(get_cluster_setting(db))
+
+@app.get("/api/parameter-trials")
+def list_trials(batch_id: int | None = None, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    stmt = select(ParameterTrial).order_by(ParameterTrial.id.desc())
+    if batch_id is not None:
+        stmt = stmt.where(ParameterTrial.batch_id == batch_id)
+    return [trial_view(t) for t in db.execute(stmt).scalars().all()]
+
+@app.get("/api/parameter-trials/{trial_id}")
+def trial_detail(trial_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    trial = db.get(ParameterTrial, trial_id)
+    if not trial: raise HTTPException(404, "对照试算报告不存在")
+    return trial_view(trial)
+
+def _prepare_trial(db, batch, payload):
+    setting = get_cluster_setting(db)
+    baseline = {"eps_m": setting.eps_m, "min_samples": setting.min_samples}
+    candidate = {"eps_m": round(float(payload.eps_m), 2), "min_samples": int(payload.min_samples)}
+    if not (EPS_LIMITS[0] <= candidate["eps_m"] <= EPS_LIMITS[1]):
+        raise HTTPException(422, f"eps_m 必须在 {EPS_LIMITS[0]}–{EPS_LIMITS[1]} 米之间")
+    if not (MIN_SAMPLES_LIMITS[0] <= candidate["min_samples"] <= MIN_SAMPLES_LIMITS[1]):
+        raise HTTPException(422, f"min_samples 必须在 {MIN_SAMPLES_LIMITS[0]}–{MIN_SAMPLES_LIMITS[1]} 之间")
+    if candidate == baseline:
+        raise HTTPException(409, "候选参数与现行默认参数相同，无需对照试算")
+    points = build_input(db, batch)
+    refs = {batch.coordinate_reference, *(p["coordinate_reference"] for p in points)}
+    if len(refs) != 1:
+        raise HTTPException(status_code=409, detail={"code": "DATUM_CONFLICT", "message": "测量点存在坐标基准冲突，先统一基准再试算"})
+    try:
+        snap, digest, report = build_trial(db, batch, baseline, candidate)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    return setting, baseline, candidate, snap, digest, report
+
+def _persist_trial(db, *, batch, user, baseline, candidate, snap, digest, report, source_trial=None):
+    import secrets
+    trial = ParameterTrial(
+        trial_code=f"TRIAL-{batch.batch_code.replace('SURV-2026-', '')}-{int(datetime.now().timestamp())}-{secrets.token_hex(2)}",
+        batch_id=batch.id, created_by=user.id, status="open",
+        baseline_eps_m=baseline["eps_m"], baseline_min_samples=baseline["min_samples"],
+        candidate_eps_m=candidate["eps_m"], candidate_min_samples=candidate["min_samples"],
+        point_snapshot_hash=digest, point_snapshot=snap, report=report,
+    )
+    db.add(trial); db.flush()
+    record(db, user.id, "create_parameter_trial", "ParameterTrial", trial.trial_code,
+           {"batch_code": batch.batch_code, "baseline": baseline, "candidate": candidate,
+            "hot_to_scattered": report["diff"]["hot_to_scattered_count"],
+            "source_trial": source_trial.trial_code if source_trial else None})
+    db.commit(); db.refresh(trial)
+    return trial
+
+@app.post("/api/survey-batches/{batch_id}/parameter-trials")
+def create_trial(batch_id: int, payload: ParameterTrialIn, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
+    batch = db.get(SurveyBatch, batch_id)
+    if not batch: raise HTTPException(404, "测量批次不存在")
+    _, baseline, candidate, snap, digest, report = _prepare_trial(db, batch, payload)
+    trial = _persist_trial(db, batch=batch, user=user, baseline=baseline, candidate=candidate, snap=snap, digest=digest, report=report)
+    return trial_view(trial)
+
+@app.post("/api/parameter-trials/{trial_id}/retrial")
+def retrial(trial_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
+    """报告过期或默认值已变后，用最新测点与最新默认参数重新对照试算。"""
+    source = db.get(ParameterTrial, trial_id)
+    if not source: raise HTTPException(404, "对照试算报告不存在")
+    if source.status == "approved":
+        raise HTTPException(409, "已签批生效的报告不能重算")
+    batch = db.get(SurveyBatch, source.batch_id)
+    payload = ParameterTrialIn(eps_m=source.candidate_eps_m, min_samples=source.candidate_min_samples)
+    _, baseline, candidate, snap, digest, report = _prepare_trial(db, batch, payload)
+    trial = _persist_trial(db, batch=batch, user=user, baseline=baseline, candidate=candidate, snap=snap, digest=digest, report=report, source_trial=source)
+    return trial_view(trial)
+
+@app.post("/api/parameter-trials/{trial_id}/approve")
+def approve_trial(trial_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
+    # 锁默认参数单行，串行化并发签批（SQLite 不支持行锁，测试环境退化为普通读）
+    setting_stmt = select(ClusterSetting).where(ClusterSetting.id == 1)
+    if db.get_bind().dialect.name == "postgresql":
+        setting_stmt = setting_stmt.with_for_update()
+    setting = db.execute(setting_stmt).scalar_one_or_none()
+    if not setting:
+        setting = get_cluster_setting(db)
+    trial = db.get(ParameterTrial, trial_id)
+    if not trial: raise HTTPException(404, "对照试算报告不存在")
+    if trial.status == "approved":
+        raise HTTPException(409, "该报告已经签批生效")
+    if trial.status == "stale":
+        raise HTTPException(status_code=409, detail={"code": "TRIAL_STALE", "message": "测点已变动，报告已过期，请重算后再签批", "stale_reason": trial.stale_reason})
+    # 权威过期校验：即使并发的测点变动尚未触发标记，快照指纹不一致也拒绝签批
+    current_digest = snapshot_hash(snapshot_points(db, db.get(SurveyBatch, trial.batch_id)))
+    if current_digest != trial.point_snapshot_hash:
+        trial.status = "stale"
+        trial.stale_reason = "签批时发现测点快照与试算时不一致，自动置为过期"
+        db.commit()
+        raise HTTPException(status_code=409, detail={"code": "TRIAL_STALE", "message": "测点已变动，报告已过期，请重算后再签批", "stale_reason": trial.stale_reason})
+    # 默认值已被另一份先签批的报告更新：本报告必须与新默认值重新比较
+    current_default = {"eps_m": setting.eps_m, "min_samples": setting.min_samples}
+    trial_baseline = {"eps_m": trial.baseline_eps_m, "min_samples": trial.baseline_min_samples}
+    if current_default != trial_baseline:
+        trial.status = "stale"
+        trial.stale_reason = (f"默认参数已变为 eps={current_default['eps_m']}m / min_samples={current_default['min_samples']}，"
+                              "本报告的对照基线失效，需与新默认值重新比较")
+        db.commit()
+        raise HTTPException(status_code=409, detail={"code": "TRIAL_BASELINE_CHANGED", "message": trial.stale_reason, "current_default": current_default})
+    setting.eps_m = trial.candidate_eps_m
+    setting.min_samples = trial.candidate_min_samples
+    setting.updated_by = user.id
+    setting.updated_at = datetime.now(timezone.utc)
+    trial.status = "approved"
+    trial.approved_by = user.id
+    trial.approved_at = datetime.now(timezone.utc)
+    # 并发签批：其余未签批报告全部过期，必须与新默认值重新比较
+    others = db.execute(select(ParameterTrial).where(ParameterTrial.id != trial.id, ParameterTrial.status == "open")).scalars().all()
+    for other in others:
+        other.status = "stale"
+        other.stale_reason = f"报告 {trial.trial_code} 已先签批成为新默认值，本报告需与新默认值重新比较"
+    record(db, user.id, "approve_parameter_trial", "ParameterTrial", trial.trial_code,
+           {"new_default": {"eps_m": setting.eps_m, "min_samples": setting.min_samples},
+            "invalidated_trials": [o.trial_code for o in others]})
+    db.commit(); db.refresh(trial)
+    return {"trial": trial_view(trial), "cluster_setting": setting_view(setting)}
 
 @app.get("/api/zones")
 def zones(db: Session = Depends(get_db), user: User = Depends(current_user)):

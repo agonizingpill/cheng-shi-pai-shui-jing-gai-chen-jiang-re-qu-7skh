@@ -34,3 +34,7 @@ class ResurveyIn(BaseModel):
     measured_at: datetime
     settlement_after_mm: float = Field(ge=0, le=200)
     notes: str = ""
+
+class ParameterTrialIn(BaseModel):
+    eps_m: float = Field(gt=0, le=200)
+    min_samples: int = Field(ge=2, le=20)

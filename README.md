@@ -13,7 +13,8 @@
 ## 主要功能
 
 - 井盖资产与测量批次登记，记录坐标基准、仪器、沉降值和测量质量状态。
-- 对同一坐标基准的测量点执行 DBSCAN，使用局部密度评分排序维修片区。
+- 对同一坐标基准的测量点执行 DBSCAN，使用局部密度评分排序维修片区；默认参数（eps / min_samples）由测绘主管通过对照试算签批调整。
+- 参数调参对照试算：同一批测点分别按现行默认参数与候选参数各试算一次，只产出对照报告（不写热区、不改测点），明确标出“热区 → 散点”与“散点 → 热区”的井盖；测点变动后报告自动过期，重算后才可签批。
 - 发现施工边界冲突时阻止直接施工，主管按道路边界拆分片区并保留原始聚类证据。
 - 施工联动单提交、主管确认、维修启动、复测提交和主管核验销项。
 - JWT 三角色权限、审计日志、请求限流、Redis 异步任务和 worker 心跳。
@@ -51,7 +52,19 @@ docker compose exec backend python -m scripts.seed_demo
 
 ## 算法口径
 
-worker 使用固定参数 `DBSCAN(eps=26m, min_samples=3)` 对同一测量批次的二维投影坐标聚类。每个非噪声簇写入 `RepairZone`。局部密度评分为 `簇内点数 / 外接矩形面积 × 10,000`。坐标基准集合不为单一值时，后端以 `409 DATUM_CONFLICT` 拒绝聚类。算法输入、参数、结果摘要、失败状态和完成时间均写入 `AnalysisJob`。
+worker 使用当前生效默认参数 `DBSCAN(eps, min_samples)`（初始值 `eps=26m, min_samples=3`，存于 `cluster_settings` 单行表）对同一测量批次的二维投影坐标聚类。参数在**入队时快照**进 `AnalysisJob.input_summary.params`：新任务用当前批准值，已排队任务始终按入队时的参数运行，调参不影响在途任务。每个非噪声簇写入 `RepairZone`。局部密度评分为 `簇内点数 / 外接矩形面积 × 10,000`。坐标基准集合不为单一值时，后端以 `409 DATUM_CONFLICT` 拒绝聚类。算法输入、参数、结果摘要、失败状态和完成时间均写入 `AnalysisJob`。
+
+## 参数对照试算与签批规则
+
+测绘主管在测绘图板下方的“默认聚类参数调参对照”面板工作，规则如下：
+
+1. **只出对照报告**：试算对同一批测点分别用现行默认参数（基线）与候选参数各跑一次 DBSCAN，结果存于 `ParameterTrial`，不创建/修改 `RepairZone`，不回写测点标签。
+2. **标出变化井盖**：报告给出热区数、散点数对比，并列出每个“热区 → 散点”（`hot_to_scattered`）、“散点 → 热区”（`scattered_to_hot`）和热区间迁移井盖的编号与前后标签。
+3. **测点变动即过期**：报告保存测点快照与 SHA-256 指纹；新增测点或修正坐标基准后，该批次所有未签批报告自动置为 `stale`，签批时另有指纹权威校验兜底，必须重算才能签。
+4. **并发签批**：两份报告可并发提交审批。先签批的候选参数写入 `cluster_settings` 成为新默认值，其余未签批报告全部置为 `stale`；再签批时若基线已不等于当前默认值，返回 `409 TRIAL_BASELINE_CHANGED`，需用重算接口与新默认值重新比较。
+5. **权限**：发起试算、重算、签批均要求 `supervisor`；`operator`/`viewer` 只读查看报告与差异。
+
+相关接口：`GET /api/cluster-settings`、`POST /api/survey-batches/{id}/parameter-trials`、`GET /api/parameter-trials`、`POST /api/parameter-trials/{id}/retrial`、`POST /api/parameter-trials/{id}/approve`。
 
 ## 技术栈与目录
 
@@ -66,13 +79,15 @@ worker 使用固定参数 `DBSCAN(eps=26m, min_samples=3)` 对同一测量批次
 共享枚举在 `backend/src/constants/enums.py` 与前端状态渲染共同出现。角色枚举在 `backend/src/security.py`、`backend/src/main.py` 和 `frontend/src/app.js` 中使用。片区、施工单、批次状态在 `backend/src/constants/enums.py`、`backend/src/models.py`、`backend/src/main.py` 和前端各页面中出现。
 
 ```text
-backend/src/models.py                 领域表与关联
-backend/src/services/cluster.py       DBSCAN 与局部密度评分
-backend/src/main.py                   认证、领域路由、状态规则
+backend/src/models.py                 领域表与关联（含 ClusterSetting / ParameterTrial）
+backend/src/services/cluster.py       DBSCAN 与局部密度评分（按入队快照参数执行）
+backend/src/services/trial.py         对照试算、测点快照指纹与差异报告
+backend/src/main.py                   认证、领域路由、试算签批与状态规则
 backend/scripts/seed_demo.py           幂等演示数据
-frontend/src/app.js                   四个业务页面与交互
+frontend/src/app.js                   四个业务页面与参数试算面板
 frontend/src/api/client.js             API 封装
 frontend/src/styles.css                市政测绘图板视觉系统
+tests/                                无第三方依赖的端到端业务验证（Python 桩环境 + 前端渲染冒烟）
 test-artifacts/gb-1070/                验收脚本、截图与追踪文档
 ```
 
